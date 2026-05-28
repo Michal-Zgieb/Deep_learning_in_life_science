@@ -286,15 +286,15 @@ def plot_optimization_curve(history: list[float], task_id: str):
 def plot_saliency_map(gradients: np.ndarray, task_id: str):
     """
     Renderuje mapę cieplną (Heatmap) wyciągniętą bezpośrednio z silnika wnioskowania modelu.
-    Wykazuje na 2 osiach (Pozycja oraz Nukleotyd), które komórki macierzy powodowały
-    najwyższą aktywację głowicy. Potwierdza zjawisko wyłapywania biologicznych elementów regulatorowych.
+    Pokazuje całą sekwencję (230 bp).
     """
-    plt.figure(figsize=(15, 3))
-    sns.heatmap(gradients[:, :50], cmap="coolwarm", center=0, yticklabels=['A', 'C', 'G', 'T'])
-    plt.title(f"Saliency Map (Initial Gradients) - {task_id} (Pierwsze 50 bp)")
+    plt.figure(figsize=(25, 3))
+    sns.heatmap(gradients, cmap="coolwarm", center=0, yticklabels=['A', 'C', 'G', 'T'])
+    plt.title(f"Saliency Map (Initial Gradients) - {task_id} (Pełna sekwencja)")
     plt.xlabel("Pozycja w sekwencji")
     plt.ylabel("Nukleotyd")
     plt.tight_layout()
+    
     safe_name = "".join([c if c.isalnum() else "_" for c in task_id])
     plt.savefig(f"{safe_name}_saliency.png")
     plt.close()
