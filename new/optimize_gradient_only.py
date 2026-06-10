@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Skrypt do zaawansowanej optymalizacji sekwencji DNA za pomocą przeszukiwania wiązkowego.
-Wykorzystuje atrybucję gradientową jako filtr wstępny oraz rzeczywiste predykcje modelu
-jako twarde kryterium selekcji, co eliminuje błędy wynikające z nieliniowości sieci CNN.
+Skrypt do zaawansowanej optymalizacji sekwencji DNA za pomocą przeszukiwania wiązkowego (Beam Search).
+
+Wykorzystuje atrybucję gradientową jako filtr wstępny oraz rzeczywiste predykcje modelu CNN
+jako twarde kryterium selekcji, co eliminuje błędy wynikające z nieliniowości sieci.
 """
 
 import random
@@ -22,10 +23,13 @@ SEQUENCE_LENGTH = 230
 def set_seed(seed: int = 3) -> None:
     """
     Ustawia stałe ziarno losowości dla generatorów PyTorch, NumPy oraz modułu random.
+
+    Wymusza w pełni deterministyczną pracę algorytmów na procesorach graficznych
+    poprzez zablokowanie dynamicznego profilowania cuDNN (benchmark = False).
     Gwarantuje identyczny przebieg przeszukiwania wiązkowego przy każdym uruchomieniu.
 
     Args:
-        seed (int): Wartość inicjalizująca dla generatorów liczb pseudolosowych.
+        seed (int): Wartość inicjalizująca dla generatorów liczb pseudolosowych. Domyślnie 3.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -43,17 +47,16 @@ class SEBlock(nn.Module):
     Dynamicznie waży istotność poszczególnych kanałów cech wyekstrahowanych
     przez warstwy konwolucyjne. Składa się z etapu 'Squeeze' (agregacja globalnego
     kontekstu za pomocą AdaptiveAvgPool1d) oraz 'Excitation' (dwuwarstwowy perceptron
-    redukujący i odtwarzający wymiar kanałów z aktywacją Sigmoid). Wynikowy wektor
-    wag służy do skalowania map cech, co pozwala wyciszyć szum tła sekwencji.
+    z aktywacją Sigmoid). Wynikowy wektor wag służy do skalowania map cech.
     """
 
     def __init__(self, channels: int, reduction: int = 16) -> None:
         """
-        Inicjalizuje warstwy liniowe (zrealizowane jako Conv1d z kernelem 1) dla bloku SE.
+        Inicjalizuje warstwy modułu SE.
 
         Args:
             channels (int): Liczba kanałów wejściowych mapy cech.
-            reduction (int): Współczynnik redukcji wymiarowości w warstwie ukrytej perceptrona.
+            reduction (int): Współczynnik redukcji wymiarowości w warstwie ukrytej perceptrona. Domyślnie 16.
         """
         super().__init__()
         mid_channels = max(1, channels // reduction)
@@ -70,10 +73,10 @@ class SEBlock(nn.Module):
         Przetwarza tensor wejściowy i nakłada wyliczone wagi uwagi kanałowej.
 
         Args:
-            x (torch.Tensor): Tensor cech o kształcie [Batch, Channels, Length].
+            x (torch.Tensor): Tensor wejściowy o kształcie (Batch, Channels, Length).
 
         Returns:
-            torch.Tensor: Przeskalowany tensor wejściowy o identycznym kształcie.
+            torch.Tensor: Przeskalowany tensor wyjściowy o identycznym kształcie co wejście.
         """
         return x * self.se(x)
 
@@ -82,21 +85,20 @@ class ResidualDilatedBlock(nn.Module):
     """
     Rezydualny blok konwolucyjny wykorzystujący sploty z dylatacją (rozszerzeniem).
 
-    Dylatacja pozwala na wykładnicze zwiększanie efektywnego pola widzenia (receptive field)
-    filtrów bez zwiększania liczby parametrów sieci. Umożliwia to modelowi wykrywanie
-    odległych zależności przestrzennych między motywami regulatorowymi w DNA. Blok zawiera
-    dwie warstwy splotowe, normalizację Batch Normalization, aktywację GELU, Dropout,
-    blok uwagi SEBlock oraz połączenie skrócone (skip connection) zapobiegające zanikaniu gradientu.
+    Dylatacja pozwala na wykładnicze zwiększanie efektywnego pola widzenia filtrów
+    bez zwiększania liczby parametrów sieci. Blok zawiera warstwy splotowe, normalizację
+    Batch Normalization, aktywację GELU, Dropout, blok uwagi SEBlock oraz połączenie
+    rezydualne (skip connection) zapobiegające zanikaniu gradientu.
     """
 
     def __init__(self, channels: int, dilation: int, dropout: float) -> None:
         """
-        Inicjalizuje warstwy konwolucyjne i normalizacyjne z uwzględnieniem zadanego kroku dylatacji.
+        Inicjalizuje warstwy konwolucyjne i normalizacyjne bloku rezydualnego.
 
         Args:
             channels (int): Liczba kanałów przetwarzanych wewnątrz bloku.
             dilation (int): Wartość dylatacji (rozszerzenia) dla warstw konwolucyjnych.
-            dropout (float): Prawdopodobieństwo wyzerowania aktywacji w warstwie regularyzacyjnej.
+            dropout (float): Prawdopodobieństwo wyzerowania aktywacji w warstwie regularyzacyjnej Dropout.
         """
         super().__init__()
         kernel_size = 5
@@ -114,26 +116,26 @@ class ResidualDilatedBlock(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """
-        Realizuje połączenie rezydualne, sumując wejście bezpośrednie z przetworzonym przez blok.
+        Wykonuje przejście w przód z połączeniem rezydualnym (F(x) + x).
 
         Args:
-            inputs (torch.Tensor): Tensor wejściowy o kształcie [Batch, Channels, Length].
+            inputs (torch.Tensor): Tensor wejściowy o kształcie (Batch, Channels, Length).
 
         Returns:
-            torch.Tensor: Wynik sumowania po przejściu przez nieliniowość GELU.
+            torch.Tensor: Przetworzony tensor po nieliniowości GELU.
         """
         return self.activation(inputs + self.block(inputs))
 
 
 class ResidualDilatedMultitaskCnn(nn.Module):
     """
-    Główna wielozadaniowa sieć konwolucyjna do predykcji aktywności sekwencji regulatorowych.
+    Główna wielozadaniowa sieć konwolucyjna (CNN) do predykcji aktywności sekwencji DNA.
 
-    - Warstwa wejściowa (stem): Ekstrahuje pierwotne cechy lokalnych k-merów za pomocą konwolucji.
-    - Blok rezydualny: Przetwarza sygnał przez sekwencję bloków o rosnącej dylatacji (1, 2, 4, 8, 16).
-    - Agregacja przestrzenna: Łączy globalny pooling maksymalny i średni w celu zachowania informacji
-      o obecności i intensywności motywów biologicznych.
-    - Głowice wyjściowe: Równolegle realizuje regresję liniową parametru rna_dna_ratio oraz klasyfikację aktywności.
+    Architektura składa się z:
+    - Warstwy wejściowej (stem) ekstrahującej cechy lokalnych k-merów.
+    - Serii pięciu bloków rezydualnych z wykładniczo rosnącą dylatacją.
+    - Globalnego poolingu agregującego macierz przestrzenną (średnia + maksimum).
+    - Dwóch głowic wyjściowych: regresyjnej (rna_dna_ratio) oraz klasyfikacyjnej (is_active).
     """
 
     def __init__(
@@ -144,13 +146,13 @@ class ResidualDilatedMultitaskCnn(nn.Module):
             dense_units: int = 128,
     ) -> None:
         """
-        Konstruuje pełne warstwy sieci neuronowej na podstawie zadanych hiperparametrów.
+        Inicjalizuje architekturę sieci na podstawie zadanych hiperparametrów.
 
         Args:
-            dropout (float): Współczynnik odrzucenia dla warstw Dropout.
-            channels (int): Liczba kanałów ukrytych w blokach konwolucyjnych.
-            dilations (tuple[int, ...]): Sekwencja kroków dylatacji dla kolejnych bloków.
-            dense_units (int): Liczba neuronów w wspólnej warstwie w pełni połączonej.
+            dropout (float): Współczynnik odrzucenia dla warstw Dropout. Domyślnie 0.20.
+            channels (int): Liczba kanałów w ukrytych warstwach konwolucyjnych. Domyślnie 96.
+            dilations (tuple[int, ...]): Sekwencja wartości dylatacji dla kolejnych bloków. Domyślnie (1, 2, 4, 8, 16).
+            dense_units (int): Liczba neuronów we wspólnej warstwie w pełni połączonej. Domyślnie 128.
         """
         super().__init__()
         self.stem = nn.Sequential(
@@ -172,10 +174,10 @@ class ResidualDilatedMultitaskCnn(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Wykonuje pełne przejście w przód (Forward Pass) przez sieć wielozadaniową.
+        Wykonuje przejście w przód przez sieć wielozadaniową.
 
         Args:
-            inputs (torch.Tensor): Tensor z zakodowanymi one-hot sekwencjami o kształcie [Batch, 4, 230].
+            inputs (torch.Tensor): Tensor wejściowy z zakodowanymi sekwencjami one-hot o kształcie (Batch, 4, Length).
 
         Returns:
             tuple[torch.Tensor, torch.Tensor]: Para tensorów wyjściowych: (wynik_regresji, logity_klasyfikacji).
@@ -189,15 +191,16 @@ class ResidualDilatedMultitaskCnn(nn.Module):
 
 def one_hot_encode(sequences: list[str]) -> np.ndarray:
     """
-    Dokonuje transformacji tekstowych sekwencji nukleotydowych na postać macierzy binarnych.
+    Zamienia tekstowe sekwencje nukleotydowe na macierze binarne (one-hot encoding).
 
-    Mapuje zasady azotowe na konkretne indeksy kanałów: A -> 0, C -> 1, G -> 2, T -> 3.
+    Zasady azotowe mapowane są na indeksy kanałów: A -> 0, C -> 1, G -> 2, T -> 3.
+    Wszelkie nieznane znaki pozostają zakodowane jako wektory zerowe.
 
     Args:
-        sequences (list[str]): Lista ciągów tekstowych reprezentujących sekwencje DNA o stałej długości.
+        sequences (list[str]): Lista ciągów znakowych reprezentujących sekwencje DNA.
 
     Returns:
-        np.ndarray: Tablica NumPy o kształcie [Liczba_sekwencji, 4, 230] i typie float32.
+        np.ndarray: Tablica NumPy o wymiarach (Liczba_sekwencji, 4, SEQUENCE_LENGTH) i typie float32.
     """
     features = np.zeros((len(sequences), 4, SEQUENCE_LENGTH), dtype=np.float32)
     channel_by_base = {"A": 0, "C": 1, "G": 2, "T": 3}
@@ -210,7 +213,7 @@ def one_hot_encode(sequences: list[str]) -> np.ndarray:
 
 def select_device() -> torch.device:
     """
-    Weryfikuje konfigurację sprzętową stacji roboczej pod kątem akceleracji obliczeń.
+    Weryfikuje konfigurację sprzętową i wybiera optymalne urządzenie obliczeniowe.
 
     Returns:
         torch.device: Obiekt wskazujący na akcelerator 'cuda' (jeśli dostępny) lub procesor 'cpu'.
@@ -220,15 +223,17 @@ def select_device() -> torch.device:
 
 def read_fasta(file_path: str | Path) -> dict[str, str]:
     """
-    Parsuje pliki wejściowe zapisane w standardowym formacie bioinformatycznym FASTA.
+    Parsuje pliki sekwencyjne zapisane w formacie FASTA.
 
-
+    Poprawnie obsługuje wieloliniowy zapis pojedynczych łańcuchów DNA i standaryzuje
+    wielkość liter.
 
     Args:
         file_path (str | Path): Ścieżka do docelowego pliku FASTA.
 
     Returns:
-        dict[str, str]: Słownik mapujący identyfikatory sekwencji (klucze) na surowe ciągi nukleotydów (wartości).
+        dict[str, str]: Słownik mapujący identyfikatory sekwencji na ich ciągi nukleotydowe.
+                        Zwraca pusty słownik, jeśli plik nie zostanie znaleziony.
     """
     path = Path(file_path)
     if not path.exists():
@@ -258,33 +263,33 @@ def optimize_by_beam_search(
         start_seq: str,
         device: torch.device,
         max_mutations: int | None = None,
-        beam_width: int = 5,
-        top_k_gradients: int = 20
-) -> tuple[str, list[float], np.ndarray]:
+        beam_width: int = 25,
+        top_k_gradients: int = 100
+) -> tuple[str, list[float], np.ndarray, np.ndarray]:
     """
-    Optymalizuje sekwencję DNA za pomocą algorytmu Beam Search wspomaganego gradientowo.
+    Optymalizuje sekwencję DNA wykorzystując algorytm Beam Search i atrybucję gradientową.
 
-    Zasada działania opiera się na eliminacji nieliniowych błędów aproksymacji gradientu:
-    1. Dla każdej z `beam_width` (25) aktualnie najlepszych sekwencji wyliczany jest gradient.
-    2. Na bazie różnic gradientów generuje się wyłącznie `top_k_gradients` (100) najbardziej obiecujących mutacji punktowych.
-    3. Wszystkie unikalne warianty kandydujące (max 100 na krok) są fizycznie tworzone i oceniane
-       poprzez twardy Forward Pass modelu w celu pobrania ich rzeczywistego `rna_dna_ratio`.
-    4. Pula kandydatów jest sortowana, a 25 wariantów z najwyższym realnym wynikiem tworzy nową wiązkę (Beam) dla kolejnego kroku.
-    5. Proces kończy się w momencie osiągnięcia limitu mutacji unikalnych pozycji lub po wykryciu plateau.
+    Kroki algorytmu:
+    1. Obliczenie gradientów dla `beam_width` najlepszych sekwencji w wiązce.
+    2. Wygenerowanie do `top_k_gradients` najbardziej obiecujących mutacji na podstawie różnic w gradientach.
+    3. Stworzenie fizycznych sekwencji kandydackich i ocena ich prawdziwego `rna_dna_ratio` przez twardy Forward Pass modelu.
+    4. Wybór `beam_width` wariantów z absolutnie najwyższym rzeczywistym wynikiem do kolejnej rundy (Beam).
+    5. Zakończenie procesu w przypadku osiągnięcia limitu mutacji na unikalnych pozycjach lub po wykryciu plateau.
 
     Args:
-        model (nn.Module): Wytrenowana sieć neuronowa służąca jako środowisko symulacyjne.
-        start_seq (str): Pierwotna sekwencja nukleotydowa stanowiąca punkt początkowy inżynierii.
-        device (torch.device): Urządzenie obliczeniowe (CPU/GPU).
-        max_mutations (int | None): Maksymalny budżet modyfikacji unikalnych pozycji (odległość Hamminga).
-        beam_width (int): Szerokość wiązki (liczba równolegle utrzymywanych najlepszych ścieżek).
-        top_k_gradients (int): Liczba mutacji generowanych przez gradient dla pojedynczej sekwencji z wiązki.
+        model (nn.Module): Wytrenowany model sieci neuronowej.
+        start_seq (str): Początkowa sekwencja DNA do zoptymalizowania.
+        device (torch.device): Urządzenie obliczeniowe (CUDA/CPU).
+        max_mutations (int | None): Limit zmodyfikowanych pozycji (odległość Hamminga). Brak limitu jeśli None.
+        beam_width (int): Szerokość wiązki, czyli liczba równolegle utrzymywanych najlepszych ścieżek. Domyślnie 25.
+        top_k_gradients (int): Liczba mutacji punktowych generowanych z gradientu dla jednej sekwencji w danym kroku. Domyślnie 100.
 
     Returns:
-        tuple[str, list[float], np.ndarray]:
+        tuple[str, list[float], np.ndarray, np.ndarray]:
             - zoptymalizowana sekwencja końcowa (str),
-            - historia najlepszych rzeczywistych wyników rna_dna_ratio na krok (list[float]),
-            - początkowa macierz gradientów wejściowych 4x230 dla sekwencji startowej (np.ndarray).
+            - historia najlepszych rzeczywistych wyników rna_dna_ratio dla poszczególnych iteracji (list[float]),
+            - początkowa macierz gradientów wejściowych o kształcie (4, 230) dla sekwencji startowej (np.ndarray),
+            - zarejestrowany dziennik wykonanych mutacji punktowych (np.ndarray).
     """
     bases = ["A", "C", "G", "T"]
     base_to_idx = {"A": 0, "C": 1, "G": 2, "T": 3}
@@ -298,21 +303,22 @@ def optimize_by_beam_search(
     initial_gradients = init_feat.grad.cpu().numpy()[0].copy()
     initial_score = init_pred.item()
 
-
-    beam = [(initial_score, list(start_seq.upper()), 0, set())]
+    beam = [(initial_score, list(start_seq.upper()), 0, set(), [])]
     seen_sequences = {hash(start_seq.upper())}
 
     best_overall_seq = list(start_seq.upper())
     best_overall_score = initial_score
+    best_overall_log = []
 
     history = [initial_score]
     patience_counter = 0
+    step = 1
 
     while True:
         candidates_seqs = []
         candidates_meta = []
 
-        for b_score, b_seq, b_mut_count, b_mut_pos in beam:
+        for b_score, b_seq, b_mut_count, b_mut_pos, b_log in beam:
             if max_mutations is not None and b_mut_count >= max_mutations:
                 continue
 
@@ -352,8 +358,11 @@ def optimize_by_beam_search(
                     new_mut_pos = b_mut_pos.copy()
                     new_mut_pos.add(pos)
 
+                    new_log = b_log.copy()
+                    new_log.append((step, pos, base_to_idx[old_base], base_to_idx[new_base]))
+
                     candidates_seqs.append(new_seq_str)
-                    candidates_meta.append((new_mut_pos, b_mut_count + 1))
+                    candidates_meta.append((new_mut_pos, new_log, b_mut_count + 1))
 
         if not candidates_seqs:
             break
@@ -371,8 +380,9 @@ def optimize_by_beam_search(
             scored_candidates.append((
                 all_preds[i],
                 list(candidates_seqs[i]),
-                candidates_meta[i][1],
-                candidates_meta[i][0]
+                candidates_meta[i][2],  # mut_count
+                candidates_meta[i][0],  # mut_pos
+                candidates_meta[i][1]  # log
             ))
 
         scored_candidates.sort(reverse=True, key=lambda x: x[0])
@@ -384,6 +394,7 @@ def optimize_by_beam_search(
         if step_best_score > best_overall_score:
             best_overall_score = step_best_score
             best_overall_seq = beam[0][1]
+            best_overall_log = beam[0][4]
             patience_counter = 0
         else:
             patience_counter += 1
@@ -393,20 +404,22 @@ def optimize_by_beam_search(
         if max_mutations is not None and all(b[2] >= max_mutations for b in beam):
             break
 
-    return "".join(best_overall_seq), history, initial_gradients
+        step += 1
+
+    mutations_array = np.array(best_overall_log, dtype=int) if best_overall_log else np.empty((0, 4), dtype=int)
+    return "".join(best_overall_seq), history, initial_gradients, mutations_array
 
 
 def plot_optimization_curve(history: list[float], task_id: str):
     """
-    Wyrysowuje i eksportuje wykres krzywej optymalizacji dla danego podzadania.
+    Rysuje i eksportuje do pliku wykres krzywej optymalizacji rna_dna_ratio.
 
-    Wykres przedstawia wzrost rzeczywistego, zweryfikowanego parametru rna_dna_ratio
-    na osi Y w odniesieniu do kolejnych kroków (rund) algorytmu przeszukiwania wiązkowego na osi X.
-    Spełnia formalny wymóg dokumentacji projektu: 'The Optimization Curve'.
+    Wykres przedstawia wzrost zwalidowanego parametru rna_dna_ratio na osi Y w odniesieniu
+    do kolejnych iteracji przeszukiwania wiązkowego na osi X.
 
     Args:
-        history (list[float]): Lista rzeczywistych wartości rna_dna_ratio uzyskanych w kolejnych krokach.
-        task_id (str): Identyfikator zadania używany jako nazwa pliku i element nagłówka wykresu.
+        history (list[float]): Lista rzeczywistych wartości rna_dna_ratio dla poszczególnych kroków.
+        task_id (str): Identyfikator zadania używany w tytule wykresu i przy ustalaniu nazwy pliku.
     """
     plt.figure(figsize=(8, 5))
     plt.plot(range(len(history)), history, marker='o', linestyle='-', color='b')
@@ -422,15 +435,14 @@ def plot_optimization_curve(history: list[float], task_id: str):
 
 def plot_saliency_map(gradients: np.ndarray, task_id: str):
     """
-    Generuje i eksportuje pełnowymiarową mapę istotności (Saliency Map) dla całej sekwencji.
+    Generuje i eksportuje do pliku mapę istotności (Saliency Map) dla pełnej sekwencji.
 
-    Wizualizuje początkową macierz gradientów 4x230 jako dwuwymiarową heatmapę.
-    Wskazuje pozycje i konkretne nukleotydy, na które model wykazuje najwyższą wrażliwość,
-    co służy jako matematyczny dowód na identyfikację biologicznych motywów regulatorowych.
+    Wizualizuje początkową macierz gradientów jako mapę cieplną, wskazując nukleotydy
+    i pozycje w łańcuchu DNA o największym wpływie na wynik predykcji.
 
     Args:
-        gradients (np.ndarray): Macierz gradientów o kształcie [4, 230] pobrana dla pierwotnej sekwencji.
-        task_id (str): Identyfikator zadania stosowany do parametryzacji zapisu grafiki końcowej.
+        gradients (np.ndarray): Macierz gradientów o kształcie (4, 230) wygenerowana dla sekwencji startowej.
+        task_id (str): Identyfikator zadania używany w tytule wykresu i przy ustalaniu nazwy pliku.
     """
     plt.figure(figsize=(25, 3))
     sns.heatmap(gradients, cmap="coolwarm", center=0, yticklabels=['A', 'C', 'G', 'T'])
@@ -445,14 +457,16 @@ def plot_saliency_map(gradients: np.ndarray, task_id: str):
 
 def main() -> None:
     """
-    Główna funkcja sterująca potokiem przetwarzania i inżynierii sekwencji DNA.
+    Główna funkcja sterująca potokiem optymalizacji sekwencji DNA.
 
-    1. Ustala stabilne środowisko losowości (seed=3).
-    2. Odczytuje konfigurację i wagi sieci neuronowej z pliku checkpointu 'best_checkpoint.pt'.
-    3. Przełącza sieć w tryb ewaluacji (`model.eval()`), dezaktywując warstwy regularyzacji.
-    4. Ładuje sekwencje startowe z plików FASTA (`subtaskA.fa` i `subtaskB.fa`).
-    5. Konfiguruje twarde limity modyfikacji z tabeli projektowej (40, 16, 20) oraz limit dla zadania B (200).
-    6. Wykonuje zaawansowany proces Beam Search, generując pliki raportowe .tsv i wykresy .png.
+    Realizuje następujące kroki:
+    1. Ustala stabilne ziarno losowości dla pełnej powtarzalności wyników.
+    2. Odczytuje konfigurację architektoniczną i wagi sieci neuronowej z pliku 'best_checkpoint.pt'.
+    3. Inicjuje model w trybie ewaluacyjnym na optymalnym urządzeniu sprzętowym.
+    4. Ładuje sekwencje startowe z plików 'subtaskA.fa' oraz 'subtaskB.fa'.
+    5. Konfiguruje instrukcje z limitami modyfikacji (40, 16, 20 i 200).
+    6. Uruchamia algorytm Beam Search, a po jego zakończeniu generuje wykresy, heatmapy
+       oraz zapisuje zoptymalizowane ciągi do pliku 'optimized_sequences.tsv' oraz logi mutacji do .npy.
     """
     set_seed(3)
     device = select_device()
@@ -496,8 +510,7 @@ def main() -> None:
         limit_str = str(task["limit"]) if task["limit"] is not None else "BRAK LIMITU"
         print(f"\nOptymalizacja: {task['id']} | Limit: {limit_str} | Beam: 25 | Top_K_Grad: 100")
 
-
-        opt_seq, history, initial_grads = optimize_by_beam_search(
+        opt_seq, history, initial_grads, mutations_array = optimize_by_beam_search(
             model, task["sequence"], device,
             max_mutations=task["limit"], beam_width=25, top_k_gradients=100
         )
@@ -514,11 +527,12 @@ def main() -> None:
         plot_optimization_curve(history, task['id'])
         plot_saliency_map(initial_grads, task['id'])
 
-
+        sn = "".join(c if c.isalnum() else "_" for c in task["id"])
+        np.save(f"{sn}_mutations.npy", mutations_array)
 
     if results:
         pd.DataFrame(results).to_csv("optimized_sequences.tsv", sep="\t", index=False)
-        print("\nZapisano pliki wynikowe (TSV, PNG).")
+        print("\nZapisano pliki wynikowe (TSV, PNG, NPY).")
 
 
 if __name__ == "__main__":
